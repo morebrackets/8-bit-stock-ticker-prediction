@@ -16,8 +16,13 @@ from torch.quantization import quantize_dynamic
 # Data loading and preprocessing
 def load_and_normalize_data(file_path='ticker.json'):
     """Load ticker data from JSON and normalize close prices."""
-    with open(file_path, 'r') as f:
-        data = json.load(f)
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Data file '{file_path}' not found. Please ensure ticker.json exists.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in '{file_path}': {e}")
     
     # Extract close prices
     close_prices = np.array([item['close'] for item in data], dtype=np.float32)
@@ -25,7 +30,13 @@ def load_and_normalize_data(file_path='ticker.json'):
     # Normalize to [0, 1] range
     min_price = close_prices.min()
     max_price = close_prices.max()
-    normalized_prices = (close_prices - min_price) / (max_price - min_price)
+    price_range = max_price - min_price
+    
+    # Handle edge case where all prices are the same
+    if price_range < 1e-8:
+        normalized_prices = np.zeros_like(close_prices)
+    else:
+        normalized_prices = (close_prices - min_price) / price_range
     
     return normalized_prices, min_price, max_price
 
@@ -69,8 +80,8 @@ def train_model(model, X_train, y_train, epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     # Convert to tensors
-    X_train_tensor = torch.FloatTensor(X_train).unsqueeze(-1)
-    y_train_tensor = torch.FloatTensor(y_train)
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
     
     # Move to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -110,7 +121,7 @@ def run_inference(model, last_sequence, min_price, max_price):
     model.eval()
     with torch.no_grad():
         # Prepare input
-        input_tensor = torch.FloatTensor(last_sequence).unsqueeze(0).unsqueeze(-1)
+        input_tensor = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
         
         # Predict
         prediction = model(input_tensor)
