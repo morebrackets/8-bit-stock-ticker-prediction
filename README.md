@@ -47,9 +47,26 @@ The `ticker.json` file should contain an array of objects with a `close` paramet
 
 ```json
 [
-  {"close": 1000.50},
-  {"close": 1001.25},
-  {"close": 999.75},
+  {
+        "open": 251.36,
+        "high": 251.36,
+        "low": 250.6,
+        "close": 250.6,
+        "volume": 834,
+        "vwap": 251.2067,
+        "timestamp": 1735808400000,
+        "transactions": 82
+    },
+    {
+        "open": 251.42,
+        "high": 251.42,
+        "low": 251.26,
+        "close": 251.26,
+        "volume": 1175,
+        "vwap": 251.3199,
+        "timestamp": 1735808460000,
+        "transactions": 47
+    }
   ...
 ]
 ```
