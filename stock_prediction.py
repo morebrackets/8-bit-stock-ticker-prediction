@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LSTM Stock Ticker Prediction with Dynamic Quantization
-Optimized for NVIDIA RTX 3080ti using PyTorch
+Optimized for NVIDIA RTX using PyTorch
 """
 
 import json
@@ -14,7 +14,7 @@ from torch.quantization import quantize_dynamic
 
 
 # Data loading and preprocessing
-def load_and_normalize_data(file_path='ticker.json'):
+def load_and_normalize_data(file_path='../data/in/QS-2025.json'):
     """Load ticker data from JSON and normalize features (open, high, low, close, vwap).
     Returns normalized 2D array (T, features) and the min/max for the close price for denormalization.
     """
@@ -66,33 +66,46 @@ def create_sequences(data, lookback=60, horizon=15, feature_index_close=3):
     """Create sequences for multivariate data.
 
     data: np.ndarray shape (T, features)
-    Returns X shape (N, lookback, features) and y shape (N, horizon) containing future close values.
+    Returns X shape (N, lookback, features) and y shape (N, horizon) containing
+    future close values expressed as relative returns from the last close in the
+    lookback window: (future_close - last_close) / last_close.
+    Predicting returns instead of raw prices improves stability across scales.
     """
     X, y = [], []
     total = len(data)
     for i in range(total - lookback - horizon + 1):
-        X.append(data[i:i + lookback])
-        # y should be the future close prices for the horizon
+        seq = data[i:i + lookback]
+        X.append(seq)
+        last_close = seq[-1, feature_index_close]
         future_closes = data[i + lookback:i + lookback + horizon, feature_index_close]
-        y.append(future_closes)
+        # relative returns; small epsilon to avoid div-by-zero
+        rel = (future_closes - last_close) / (last_close + 1e-8)
+        y.append(rel)
 
     return np.array(X), np.array(y)
 
 
 # LSTM Model Definition
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=5, hidden_size=50, num_layers=2, output_size=15):
+    def __init__(self, input_size=5, hidden_size=50, num_layers=2, output_size=15, dropout=0.0, bidirectional=False):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+        # LSTM dropout is applied between layers when num_layers > 1
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        fc_in = hidden_size * (2 if bidirectional else 1)
+        self.fc = nn.Linear(fc_in, output_size)
     
     def forward(self, x):
         # Initialize hidden state and cell state
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        if self.bidirectional:
+            # adjust hidden/cell for bidirectional (num_layers * num_directions, ...)
+            h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
+            c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
         
         # Forward propagate LSTM
         out, _ = self.lstm(x, (h0, c0))
@@ -101,18 +114,30 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
-def train_model(model, X_train, y_train, epochs=10, lr=0.001, batch_size=32, device=None, use_amp=False):
-    """Train the LSTM model using minibatches (lower VRAM)."""
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+def train_model(model, X_train, y_train, epochs=50, lr=1e-3, batch_size=64, device=None, use_amp=False, val_split=0.1, weight_decay=1e-5, grad_clip=1.0, early_stopping_patience=6):
+    """Train the LSTM model using minibatches with validation, scheduler, and early stopping.
+
+    Targets are expected to be relative returns (shape N x horizon).
+    Returns the trained model moved to CPU.
+    """
+    # Huber loss is more robust to outliers than MSE for financial series
+    criterion = nn.SmoothL1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Prepare tensors (stay on CPU until batch is sent)
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_tensor = torch.tensor(y_train, dtype=torch.float32)
 
-    # DataLoader for minibatches
-    dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Simple validation split
+    num_samples = len(X_tensor)
+    val_count = max(1, int(num_samples * val_split))
+    train_count = num_samples - val_count
+
+    train_dataset = torch.utils.data.TensorDataset(X_tensor[:train_count], y_tensor[:train_count])
+    val_dataset = torch.utils.data.TensorDataset(X_tensor[train_count:], y_tensor[train_count:])
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # Choose device
     if device is None:
@@ -122,14 +147,19 @@ def train_model(model, X_train, y_train, epochs=10, lr=0.001, batch_size=32, dev
 
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"Batch size: {batch_size} | Epochs: {epochs}")
+    print(f"Batch size: {batch_size} | Epochs: {epochs} | Train samples: {train_count} | Val samples: {val_count}")
 
     scaler = torch.cuda.amp.GradScaler() if (use_amp and device.type == 'cuda') else None
 
+    # LR scheduler that reduces LR on plateau of validation loss
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+
     model.train()
+    best_val = float('inf')
+    patience = 0
     for epoch in range(epochs):
         running_loss = 0.0
-        for xb, yb in loader:
+        for xb, yb in train_loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
 
@@ -139,20 +169,58 @@ def train_model(model, X_train, y_train, epochs=10, lr=0.001, batch_size=32, dev
                     outputs = model(xb)
                     loss = criterion(outputs, yb)
                 scaler.scale(loss).backward()
+                # gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 outputs = model(xb)
                 loss = criterion(outputs, yb)
                 loss.backward()
+                # gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
             running_loss += loss.item() * xb.size(0)
 
-        epoch_loss = running_loss / len(dataset)
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.6f}")
+        train_loss = running_loss / len(train_dataset)
+
+        # validation
+        model.eval()
+        val_running = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                outputs = model(xb)
+                vloss = criterion(outputs, yb)
+                val_running += vloss.item() * xb.size(0)
+        val_loss = val_running / max(1, len(val_dataset))
+
+        print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+
+        # scheduler step
+        scheduler.step(val_loss)
+
+        # early stopping
+        if val_loss < best_val - 1e-9:
+            best_val = val_loss
+            patience = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience += 1
+            if patience >= early_stopping_patience:
+                print(f"Early stopping after {epoch+1} epochs. Best val loss: {best_val:.6f}")
+                # load best state
+                model.load_state_dict(best_state)
+                model.to('cpu')
+                return model
+
+        model.train()
 
     # Move back to CPU before quantization/saving
+    model.load_state_dict(best_state)
     return model.to('cpu')
 
 def get_model_size(model_path):
@@ -162,22 +230,30 @@ def get_model_size(model_path):
     return size_mb
 
 
-def run_inference(model, last_sequence, min_price, max_price):
-    """Run inference to predict next 15 minutes."""
+def run_inference(model, last_sequence, min_price, max_price, feature_index_close=3):
+    """Run inference to predict next `horizon` minutes.
+
+    The model is expected to predict relative returns; convert them to absolute
+    prices using the last close in `last_sequence` (which is normalized).
+    """
     model.eval()
     with torch.no_grad():
         # Prepare input
         # last_sequence expected shape (lookback, features)
         input_tensor = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0)
 
-        # Predict
+        # Predict relative returns
         prediction = model(input_tensor)
+        prediction_np = prediction.squeeze().cpu().numpy()
 
-        # Denormalize predictions
-        prediction_np = prediction.squeeze().numpy()
-        denormalized = prediction_np * (max_price - min_price) + min_price
+        # Denormalize last close
+        last_close_norm = last_sequence[-1, feature_index_close]
+        last_close = last_close_norm * (max_price - min_price) + min_price
 
-        return denormalized
+        # Convert relative returns to prices
+        predicted_prices = last_close * (1.0 + prediction_np)
+
+        return predicted_prices
 
 def main():
     print("=" * 60)
@@ -214,7 +290,8 @@ def main():
     
     # Initialize model
     print("\n[3] Initializing LSTM model (hidden=50, layers=2)...")
-    model = LSTMModel(input_size=normalized_data.shape[1], hidden_size=50, num_layers=2, output_size=horizon)
+    # Enable small dropout and bidirectionality as a regularization/expressiveness boost
+    model = LSTMModel(input_size=normalized_data.shape[1], hidden_size=50, num_layers=2, output_size=horizon, dropout=0.2, bidirectional=True)
     print(f"Model architecture:\n{model}")
     
     # Train model
