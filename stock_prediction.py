@@ -15,45 +15,73 @@ from torch.quantization import quantize_dynamic
 
 # Data loading and preprocessing
 def load_and_normalize_data(file_path='ticker.json'):
-    """Load ticker data from JSON and normalize close prices."""
+    """Load ticker data from JSON and normalize features (open, high, low, close, vwap).
+    Returns normalized 2D array (T, features) and the min/max for the close price for denormalization.
+    """
+    # Support running from different working directories by resolving relative paths
+    tried_paths = [file_path]
+    if not os.path.isabs(file_path) and not os.path.exists(file_path):
+        # Try relative to this script's directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        alt = os.path.normpath(os.path.join(script_dir, file_path))
+        tried_paths.append(alt)
+        file_path = alt
+
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
     except FileNotFoundError:
-        raise FileNotFoundError(f"Data file '{file_path}' not found. Please ensure ticker.json exists.")
+        raise FileNotFoundError(f"Data file not found. Tried: {tried_paths}")
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in '{file_path}': {e}")
     
-    # Extract close prices
-    close_prices = np.array([item['close'] for item in data], dtype=np.float32)
-    
-    # Normalize to [0, 1] range
-    min_price = close_prices.min()
-    max_price = close_prices.max()
-    price_range = max_price - min_price
-    
-    # Handle edge case where all prices are the same
-    if price_range < 1e-8:
-        normalized_prices = np.zeros_like(close_prices)
-    else:
-        normalized_prices = (close_prices - min_price) / price_range
-    
-    return normalized_prices, min_price, max_price
+    # Feature order we will use
+    feature_names = ['open', 'high', 'low', 'close', 'vwap']
+
+    # Build a 2D array (T, features)
+    try:
+        arr = np.array([[float(item.get(k, 0.0)) for k in feature_names] for item in data], dtype=np.float32)
+    except Exception as e:
+        raise ValueError(f"Error extracting features from JSON: {e}")
+
+    # Compute per-feature min/max for normalization
+    mins = arr.min(axis=0)
+    maxs = arr.max(axis=0)
+    ranges = maxs - mins
+
+    # Avoid division by zero for constant columns
+    ranges[ranges < 1e-8] = 1.0
+
+    normalized = (arr - mins) / ranges
+
+    # Return normalized data and close min/max for denormalization
+    close_idx = feature_names.index('close')
+    min_close = mins[close_idx]
+    max_close = maxs[close_idx]
+
+    return normalized, min_close, max_close
 
 
-def create_sequences(data, lookback=60, horizon=15):
-    """Create sequences with lookback window and prediction horizon."""
+def create_sequences(data, lookback=60, horizon=15, feature_index_close=3):
+    """Create sequences for multivariate data.
+
+    data: np.ndarray shape (T, features)
+    Returns X shape (N, lookback, features) and y shape (N, horizon) containing future close values.
+    """
     X, y = [], []
-    for i in range(len(data) - lookback - horizon + 1):
+    total = len(data)
+    for i in range(total - lookback - horizon + 1):
         X.append(data[i:i + lookback])
-        y.append(data[i + lookback:i + lookback + horizon])
-    
+        # y should be the future close prices for the horizon
+        future_closes = data[i + lookback:i + lookback + horizon, feature_index_close]
+        y.append(future_closes)
+
     return np.array(X), np.array(y)
 
 
 # LSTM Model Definition
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=50, num_layers=2, output_size=15):
+    def __init__(self, input_size=5, hidden_size=50, num_layers=2, output_size=15):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -73,41 +101,59 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
-
-def train_model(model, X_train, y_train, epochs=10, lr=0.001):
-    """Train the LSTM model."""
+def train_model(model, X_train, y_train, epochs=10, lr=0.001, batch_size=32, device=None, use_amp=False):
+    """Train the LSTM model using minibatches (lower VRAM)."""
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    # Convert to tensors
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)
+
+    # Prepare tensors (stay on CPU until batch is sent)
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-    
-    # Move to GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # DataLoader for minibatches
+    dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Choose device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device)
+
     model = model.to(device)
-    X_train_tensor = X_train_tensor.to(device)
-    y_train_tensor = y_train_tensor.to(device)
-    
     print(f"Training on device: {device}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())} total parameters")
-    
+    print(f"Batch size: {batch_size} | Epochs: {epochs}")
+
+    scaler = torch.cuda.amp.GradScaler() if (use_amp and device.type == 'cuda') else None
+
     model.train()
     for epoch in range(epochs):
-        optimizer.zero_grad()
-        
-        # Forward pass
-        outputs = model(X_train_tensor)
-        loss = criterion(outputs, y_train_tensor)
-        
-        # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
-    
-    return model.to('cpu')  # Move back to CPU for quantization
+        running_loss = 0.0
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
 
+            optimizer.zero_grad()
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    outputs = model(xb)
+                    loss = criterion(outputs, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(xb)
+                loss = criterion(outputs, yb)
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item() * xb.size(0)
+
+        epoch_loss = running_loss / len(dataset)
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.6f}")
+
+    # Move back to CPU before quantization/saving
+    return model.to('cpu')
 
 def get_model_size(model_path):
     """Get model file size in MB."""
@@ -121,17 +167,17 @@ def run_inference(model, last_sequence, min_price, max_price):
     model.eval()
     with torch.no_grad():
         # Prepare input
-        input_tensor = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
-        
+        # last_sequence expected shape (lookback, features)
+        input_tensor = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0)
+
         # Predict
         prediction = model(input_tensor)
-        
+
         # Denormalize predictions
         prediction_np = prediction.squeeze().numpy()
         denormalized = prediction_np * (max_price - min_price) + min_price
-        
-        return denormalized
 
+        return denormalized
 
 def main():
     print("=" * 60)
@@ -140,20 +186,35 @@ def main():
     print("=" * 60)
     
     # Load and preprocess data
-    print("\n[1] Loading and normalizing data from ticker.json...")
+    print("\n[1] Loading and normalizing data from ticker json...")
     normalized_data, min_price, max_price = load_and_normalize_data()
-    print(f"Loaded {len(normalized_data)} data points")
-    print(f"Price range: ${min_price:.2f} - ${max_price:.2f}")
+    print(f"Loaded {len(normalized_data)} data points with {normalized_data.shape[1]} features")
+    print(f"Close price range: ${min_price:.2f} - ${max_price:.2f}")
     
-    # Create sequences
-    print("\n[2] Creating sequences (60m lookback, 15m horizon)...")
-    X, y = create_sequences(normalized_data, lookback=60, horizon=15)
+    # Ensure enough data for lookback + horizon
+    lookback = 60
+    horizon = 15
+    required = lookback + horizon
+    if len(normalized_data) < required + 1:
+        raise ValueError(f"Not enough data. Need at least {required+1} points (lookback+ horizon + 1).")
+    
+    # Reserve last `horizon` rows as held-out (skip them when training)
+    held_out = normalized_data[-horizon:, :]
+    training_data = normalized_data[:-horizon, :]
+    print(f"\nReserved last {horizon} tickers for validation (skipped during training).")
+    print(f"Training data length: {len(training_data)}, Held-out length: {len(held_out)}")
+    
+    # Create sequences from training data
+    print("\n[2] Creating sequences (60m lookback, 15m horizon) from training data...")
+    # feature_index_close is 3 given our feature ordering in load_and_normalize_data
+    feature_index_close = 3
+    X, y = create_sequences(training_data, lookback=lookback, horizon=horizon, feature_index_close=feature_index_close)
     print(f"Created {len(X)} sequences")
     print(f"Input shape: {X.shape}, Output shape: {y.shape}")
     
     # Initialize model
     print("\n[3] Initializing LSTM model (hidden=50, layers=2)...")
-    model = LSTMModel(input_size=1, hidden_size=50, num_layers=2, output_size=15)
+    model = LSTMModel(input_size=normalized_data.shape[1], hidden_size=50, num_layers=2, output_size=horizon)
     print(f"Model architecture:\n{model}")
     
     # Train model
@@ -194,18 +255,28 @@ def main():
     print(f"Compression:     {compression_ratio:.2f}% reduction")
     print(f"{'=' * 60}")
     
-    # Run inference with quantized model
-    print("\n[8] Running inference with quantized model...")
-    print("Predicting next 15 minutes based on last 60 minutes of data...")
-    last_sequence = normalized_data[-60:]
+    # Run inference with quantized model to predict the held-out horizon
+    print("\n[8] Running inference with quantized model to predict the held-out 15 tickers...")
+    # Use the 60 points immediately before the held-out segment (multivariate)
+    last_sequence_start = -lookback - horizon
+    last_sequence_end = -horizon if -horizon != 0 else None
+    last_sequence = normalized_data[last_sequence_start:last_sequence_end, :]
+    if last_sequence.shape[0] != lookback:
+        raise ValueError(f"Expected last_sequence of length {lookback}, got {last_sequence.shape[0]}")
+    
     predictions = run_inference(quantized_model, last_sequence, min_price, max_price)
     
-    print("\nPredicted prices for next 15 minutes:")
-    for i, price in enumerate(predictions, 1):
-        print(f"  Minute {i:2d}: ${price:.2f}")
+    # Denormalize actual held-out close values for comparison
+    # held_out shape is (horizon, features); close is at index feature_index_close (3)
+    actuals_denorm = (held_out[:, feature_index_close] * (max_price - min_price)) + min_price
+
+    print("\nPredicted vs Actual prices for the held-out 15 minutes:")
+    print(f"{'Minute':>6}  {'Predicted':>12}  {'Actual':>12}")
+    for i, (pred, actual) in enumerate(zip(predictions, actuals_denorm), 1):
+        print(f"  {i:2d}      ${float(pred):10.2f}    ${float(actual):10.2f}")
     
     print("\n" + "=" * 60)
-    print("COMPLETE! Both models saved and inference performed.")
+    print("COMPLETE! Both models saved and held-out predictions printed.")
     print("=" * 60)
 
 
