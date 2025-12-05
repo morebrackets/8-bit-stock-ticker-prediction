@@ -14,7 +14,7 @@ from torch.quantization import quantize_dynamic
 
 
 # Data loading and preprocessing
-def load_and_normalize_data(file_path='../data/in/QS-2025.json'):
+def load_and_normalize_data(file_path='ticker.json'):
     """Load ticker data from JSON and normalize features (open, high, low, close, vwap).
     Returns normalized 2D array (T, features) and the min/max for the close price for denormalization.
     """
@@ -348,9 +348,19 @@ def main():
     actuals_denorm = (held_out[:, feature_index_close] * (max_price - min_price)) + min_price
 
     print("\nPredicted vs Actual prices for the held-out 15 minutes:")
-    print(f"{'Minute':>6}  {'Predicted':>12}  {'Actual':>12}")
+    print(f"{'Minute':>6}  {'Predicted':>12}  {'Actual':>12}  {'Accuracy':>9}")
     for i, (pred, actual) in enumerate(zip(predictions, actuals_denorm), 1):
-        print(f"  {i:2d}      ${float(pred):10.2f}    ${float(actual):10.2f}")
+        p = float(pred)
+        a = float(actual)
+        # If actual price is zero, avoid division-by-zero. Treat perfect-zero match as 100% accurate.
+        if a == 0.0:
+            accuracy = 100.0 if p == 0.0 else 0.0
+        else:
+            abs_pct = abs(p - a) / abs(a)
+            # Define accuracy as (1 - abs_pct) * 100, clamped to [0, 100]
+            accuracy = max(0.0, min(100.0, (1.0 - abs_pct) * 100.0))
+
+        print(f"  {i:2d}      ${p:10.2f}    ${a:10.2f}    {accuracy:7.2f}%")
     
     print("\n" + "=" * 60)
     print("COMPLETE! Both models saved and held-out predictions printed.")
