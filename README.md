@@ -2,6 +2,8 @@
 
 PyTorch LSTM-based stock ticker prediction with dynamic int8 quantization, optimized for NVIDIA RTX 3080ti.
 
+**NOTE** This is just a test and does not predict prices very accurately as the market is influnced by many factors outside of these params.
+
 ## Features
 
 - **LSTM Model**: 2-layer LSTM with 50 hidden units
